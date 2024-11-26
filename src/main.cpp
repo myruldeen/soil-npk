@@ -1,9 +1,25 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+
+// WiFi credentials
+const char* ssid = "norazlin@unifi";
+const char* password = "bkh223811286";
+
+// MQTT Broker settings
+const char* mqtt_server = "test.mosquitto.org";
+const int mqtt_port = 1883;
+const char* mqtt_user = "";
+const char* mqtt_password = "";
+const char* mqtt_topic = "sensors/data";
+const char* device_id = "device01";  // Device identifier
+
 
 // Define RS485 pins for ESP32
 #define RX_PIN 16  // GPIO16 
@@ -13,15 +29,21 @@
 // Task handles
 TaskHandle_t sensorTaskHandle = NULL;
 TaskHandle_t displayTaskHandle = NULL;
+TaskHandle_t mqttTaskHandle = NULL;
 
 // Queue handle
 QueueHandle_t sensorQueue = NULL;
+QueueHandle_t mqttQueue = NULL;
 
 // Mutex for serial communication
 SemaphoreHandle_t serialMutex = NULL;
 
 // Create a Serial instance for RS485
 HardwareSerial RS485Serial(2); // Using UART2
+
+// Create WiFi and MQTT clients
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 // JXCT NPK Sensor commands
 const byte readN[] = {0x01, 0x03, 0x00, 0x1E, 0x00, 0x01, 0xE4, 0x0C};
@@ -47,6 +69,11 @@ struct SensorData {
     int timestamp;
     bool isValid;
 };
+
+// Function declarations
+void setupWiFi();
+void reconnectMQTT();
+void displayTask(void *parameter);
 
 // Function to calculate CRC16 Modbus
 uint16_t calculateCRC16(byte* data, int length) {
@@ -115,6 +142,45 @@ bool readParameter(const byte* command, float &value, const char* paramName) {
     return success;
 }
 
+// Task to handle MQTT communications
+void mqttTask(void *parameter) {
+    SensorData sensorData;
+    
+    while (1) {
+        if (xQueueReceive(mqttQueue, &sensorData, portMAX_DELAY) == pdTRUE) {
+            if (!mqttClient.connected()) {
+                reconnectMQTT();
+            }
+            
+            if (sensorData.isValid) {
+                // Create JSON document matching simulator format
+                StaticJsonDocument<512> doc;
+                
+                doc["sensor_id"] = device_id;
+                
+                JsonObject sensorDataObj = doc.createNestedObject("sensor_data");
+                sensorDataObj["temperature"] = round(sensorData.temperature * 100.0) / 100.0;  // Round to 2 decimals
+                sensorDataObj["moisture"] = round(sensorData.moisture * 100.0) / 100.0;
+                sensorDataObj["Ph"] = round(sensorData.pH * 100.0) / 100.0;
+                sensorDataObj["Ec"] = round(sensorData.conductivity * 100.0) / 100.0;
+                sensorDataObj["Nitrogen"] = round(sensorData.nitrogen * 100.0) / 100.0;
+                sensorDataObj["Phosphorus"] = round(sensorData.phosphorus * 100.0) / 100.0;
+                sensorDataObj["Potassium"] = round(sensorData.potassium * 100.0) / 100.0;
+                
+                char jsonBuffer[512];
+                serializeJson(doc, jsonBuffer);
+                
+                // Publish to MQTT
+                mqttClient.publish(mqtt_topic, jsonBuffer);
+                Serial.println("Published to MQTT:");
+                Serial.println(jsonBuffer);
+            }
+        }
+        mqttClient.loop();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 // Task to read sensor data
 void sensorTask(void *parameter) {
     while (1) {
@@ -138,12 +204,47 @@ void sensorTask(void *parameter) {
         success &= readParameter(readPH, sensorData.pH, "pH");
         
         sensorData.isValid = success;
-        
-        // Send data to queue
-        xQueueSend(sensorQueue, &sensorData, 0);
+
+        if (success) {
+            // Send data to display queue
+            xQueueSend(sensorQueue, &sensorData, 0);
+            
+            // Send data to MQTT queue
+            xQueueSend(mqttQueue, &sensorData, 0);
+        }
         
         // Wait before next reading
         vTaskDelay(pdMS_TO_TICKS(5000));  // 5 second delay
+    }
+}
+
+void setupWiFi() {
+    Serial.printf("Connecting to %s", ssid);
+    WiFi.begin(ssid, password);
+    
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    Serial.println("\nWiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+}
+
+void reconnectMQTT() {
+    while (!mqttClient.connected()) {
+        Serial.print("Attempting MQTT connection...");
+        String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+        
+        if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
+            Serial.println("connected");
+        } else {
+            Serial.print("failed, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" retrying in 5 seconds");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
     }
 }
 
@@ -184,12 +285,19 @@ void setup() {
     // Configure RTS pin for flow control
     pinMode(RTS_PIN, OUTPUT);
     digitalWrite(RTS_PIN, LOW);  // Set to receive mode by default
+
+    // Setup WiFi
+    setupWiFi();
+
+    // Setup MQTT
+    mqttClient.setServer(mqtt_server, mqtt_port);
     
     // Create mutex for serial communication
     serialMutex = xSemaphoreCreateMutex();
     
-    // Create queue for sensor data
+    // Create queue
     sensorQueue = xQueueCreate(5, sizeof(SensorData));
+    mqttQueue = xQueueCreate(5, sizeof(SensorData));
     
     // Create tasks
     xTaskCreatePinnedToCore(
@@ -209,6 +317,16 @@ void setup() {
         NULL,               // Parameters
         1,                  // Priority
         &displayTaskHandle, // Task handle
+        1                   // Core ID (1)
+    );
+
+    xTaskCreatePinnedToCore(
+        mqttTask,           // Task function
+        "MQTTTask",         // Name
+        4096,               // Stack size
+        NULL,               // Parameters
+        1,                  // Priority
+        &mqttTaskHandle,    // Task handle
         1                   // Core ID (1)
     );
     
