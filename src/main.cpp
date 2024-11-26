@@ -1,0 +1,221 @@
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+// Define RS485 pins for ESP32
+#define RX_PIN 16  // GPIO16 
+#define TX_PIN 17  // GPIO17
+#define RTS_PIN 4  // GPIO4 for flow control
+
+// Task handles
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t displayTaskHandle = NULL;
+
+// Queue handle
+QueueHandle_t sensorQueue = NULL;
+
+// Mutex for serial communication
+SemaphoreHandle_t serialMutex = NULL;
+
+// Create a Serial instance for RS485
+HardwareSerial RS485Serial(2); // Using UART2
+
+// JXCT NPK Sensor commands
+const byte readN[] = {0x01, 0x03, 0x00, 0x1E, 0x00, 0x01, 0xE4, 0x0C};
+const byte readP[] = {0x01, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xB5, 0xCC};
+const byte readK[] = {0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xC0};
+const byte readNPK[] = {0x01, 0x03, 0x00, 0x1E, 0x00, 0x03, 0x65, 0xCD};
+const byte readTemp[] = {0x01, 0x03, 0x00, 0x13, 0x00, 0x01, 0x75, 0xCF};
+const byte readMoisture[] = {0x01, 0x03, 0x00, 0x12, 0x00, 0x01, 0x24, 0x0F};
+const byte readEC[] = {0x01, 0x03, 0x00, 0x15, 0x00, 0x01, 0x95, 0xCE};
+const byte readPH[] = {0x01, 0x03, 0x00, 0x06, 0x00, 0x01, 0x64, 0x0B};
+
+const int commandLength = 8;
+
+// Struct to store sensor values
+struct SensorData {
+    float nitrogen;
+    float phosphorus;
+    float potassium;
+    float pH;
+    float moisture;
+    float temperature;
+    float conductivity;
+    int timestamp;
+    bool isValid;
+};
+
+// Function to calculate CRC16 Modbus
+uint16_t calculateCRC16(byte* data, int length) {
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x0001) {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+// Function to read a specific parameter
+bool readParameter(const byte* command, float &value, const char* paramName) {
+    byte responseBuffer[8];
+    bool success = false;
+    
+    if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+        digitalWrite(RTS_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        RS485Serial.write(command, commandLength);
+        RS485Serial.flush();
+        digitalWrite(RTS_PIN, LOW);
+        
+        unsigned long startTime = millis();
+        while (RS485Serial.available() < 7 && (millis() - startTime) < 1000) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        
+        if (RS485Serial.available() >= 7) {
+            int bytesRead = RS485Serial.readBytes(responseBuffer, 7);
+            if (bytesRead == 7) {
+                uint16_t receivedCRC = (responseBuffer[bytesRead-1] << 8) | responseBuffer[bytesRead-2];
+                uint16_t calculatedCRC = calculateCRC16(responseBuffer, bytesRead-2);
+                
+                if (receivedCRC == calculatedCRC) {
+                    uint16_t rawValue = (responseBuffer[3] << 8) | responseBuffer[4];
+                    
+                    // Special handling for pH values
+                    if (command == readPH) {
+                        value = rawValue / 100.0; // Divide by 100 instead of 10 for pH
+                        // Sanity check for pH values
+                        if (value < 0 || value > 14) {
+                            Serial.println("Warning: pH value out of range!");
+                            success = false;
+                        } else {
+                            success = true;
+                        }
+                    } else {
+                        value = rawValue / 10.0; // Normal scaling for other parameters
+                        success = true;
+                    }
+                    
+                    Serial.printf("%s: %.1f\n", paramName, value);
+                }
+            }
+        }
+        xSemaphoreGive(serialMutex);
+    }
+    return success;
+}
+
+// Task to read sensor data
+void sensorTask(void *parameter) {
+    while (1) {
+        SensorData sensorData;
+        sensorData.isValid = false;
+        sensorData.timestamp = millis();
+        
+        bool success = true;
+        success &= readParameter(readN, sensorData.nitrogen, "Nitrogen");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        success &= readParameter(readP, sensorData.phosphorus, "Phosphorus");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        success &= readParameter(readK, sensorData.potassium, "Potassium");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        success &= readParameter(readTemp, sensorData.temperature, "Temperature");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        success &= readParameter(readMoisture, sensorData.moisture, "Moisture");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        success &= readParameter(readEC, sensorData.conductivity, "Conductivity");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        success &= readParameter(readPH, sensorData.pH, "pH");
+        
+        sensorData.isValid = success;
+        
+        // Send data to queue
+        xQueueSend(sensorQueue, &sensorData, 0);
+        
+        // Wait before next reading
+        vTaskDelay(pdMS_TO_TICKS(5000));  // 5 second delay
+    }
+}
+
+// Task to display sensor data
+void displayTask(void *parameter) {
+    SensorData sensorData;
+    
+    while (1) {
+        if (xQueueReceive(sensorQueue, &sensorData, portMAX_DELAY) == pdTRUE) {
+            if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+                if (sensorData.isValid) {
+                    Serial.println("\n=== Complete Sensor Reading ===");
+                    Serial.printf("Nitrogen: %.1f mg/kg\n", sensorData.nitrogen);
+                    Serial.printf("Phosphorus: %.1f mg/kg\n", sensorData.phosphorus);
+                    Serial.printf("Potassium: %.1f mg/kg\n", sensorData.potassium);
+                    Serial.printf("pH: %.1f\n", sensorData.pH);
+                    Serial.printf("Moisture: %.1f %%\n", sensorData.moisture);
+                    Serial.printf("Temperature: %.1f °C\n", sensorData.temperature);
+                    Serial.printf("Conductivity: %.1f us/cm\n", sensorData.conductivity);
+                    Serial.println("==============================\n");
+                } else {
+                    Serial.println("Failed to read complete sensor data!");
+                }
+                xSemaphoreGive(serialMutex);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void setup() {
+    // Initialize debug serial
+    Serial.begin(115200);
+    
+    // Initialize RS485 serial
+    RS485Serial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+    
+    // Configure RTS pin for flow control
+    pinMode(RTS_PIN, OUTPUT);
+    digitalWrite(RTS_PIN, LOW);  // Set to receive mode by default
+    
+    // Create mutex for serial communication
+    serialMutex = xSemaphoreCreateMutex();
+    
+    // Create queue for sensor data
+    sensorQueue = xQueueCreate(5, sizeof(SensorData));
+    
+    // Create tasks
+    xTaskCreatePinnedToCore(
+        sensorTask,          // Task function
+        "SensorTask",        // Name
+        4096,               // Stack size
+        NULL,               // Parameters
+        2,                  // Priority
+        &sensorTaskHandle,  // Task handle
+        0                   // Core ID (0)
+    );
+    
+    xTaskCreatePinnedToCore(
+        displayTask,         // Task function
+        "DisplayTask",       // Name
+        4096,               // Stack size
+        NULL,               // Parameters
+        1,                  // Priority
+        &displayTaskHandle, // Task handle
+        1                   // Core ID (1)
+    );
+    
+    Serial.println("ESP32 RS485 JXCT NPK Sensor Reader Started");
+}
+
+void loop() {
+    // Empty loop - tasks handle everything
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
