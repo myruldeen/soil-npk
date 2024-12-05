@@ -23,6 +23,9 @@ const char* mqtt_password = "";
 const char* mqtt_topic = "sensors/data";
 const char* device_id = "device01";  // Device identifier
 
+// Add LED pin definition after other pin definitions
+#define LED_PIN 2  // Built-in LED on most ESP32 boards
+
 // OLED display settings
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -88,6 +91,7 @@ void setupWiFi();
 void setupOLED();
 void reconnectMQTT();
 void displayTask(void *parameter);
+void blinkLED(int times = 1, int duration = 100); 
 
 // Function to calculate CRC16 Modbus
 uint16_t calculateCRC16(byte* data, int length) {
@@ -184,10 +188,18 @@ void mqttTask(void *parameter) {
                 char jsonBuffer[512];
                 serializeJson(doc, jsonBuffer);
                 
-                // Publish to MQTT
-                mqttClient.publish(mqtt_topic, jsonBuffer);
-                Serial.println("Published to MQTT:");
-                Serial.println(jsonBuffer);
+                // Publish to MQTT and blink LED if successful
+                if (mqttClient.publish(mqtt_topic, jsonBuffer)) {
+                    blinkLED(2, 100);  // Double blink for successful publish
+                    Serial.println("Published to MQTT:");
+                    Serial.println(jsonBuffer);
+                } else {
+                    blinkLED(1, 1000);  // Long single blink for failure
+                    Serial.println("Failed to publish to MQTT!");
+                }
+                // mqttClient.publish(mqtt_topic, jsonBuffer);
+                // Serial.println("Published to MQTT:");
+                // Serial.println(jsonBuffer);
             }
         }
         mqttClient.loop();
@@ -358,7 +370,23 @@ void displayTask(void *parameter) {
     }
 }
 
+// LED blink function
+void blinkLED(int times, int duration) {  // Remove default arguments here
+    for(int i = 0; i < times; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(duration);
+        digitalWrite(LED_PIN, LOW);
+        if(i < times - 1) {
+            delay(duration);
+        }
+    }
+}
+
 void setup() {
+     // Initialize LED pin
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);  // Start with LED off
+
     // Initialize debug serial
     Serial.begin(115200);
 
