@@ -3,6 +3,9 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -20,6 +23,15 @@ const char* mqtt_password = "";
 const char* mqtt_topic = "sensors/data";
 const char* device_id = "device01";  // Device identifier
 
+// OLED display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1        // Reset pin (-1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C  // Usually 0x3C for 128x64
+#define OLED_SDA 21         // Default SDA pin for ESP32
+#define OLED_SCL 22         // Default SCL pin for ESP32
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Define RS485 pins for ESP32
 #define RX_PIN 16  // GPIO16 
@@ -68,10 +80,12 @@ struct SensorData {
     float conductivity;
     int timestamp;
     bool isValid;
+    uint8_t displayPage; // To track which page of data to show
 };
 
 // Function declarations
 void setupWiFi();
+void setupOLED();
 void reconnectMQTT();
 void displayTask(void *parameter);
 
@@ -248,9 +262,34 @@ void reconnectMQTT() {
     }
 }
 
+// Function to initialize OLED
+void setupOLED() {
+    Wire.begin(OLED_SDA, OLED_SCL);
+    
+    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println(F("SSD1306 allocation failed"));
+        return;
+    }
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.cp437(true);
+    
+    // Show initial message
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println(F("NPK Sensor"));
+    display.println(F("Initializing..."));
+    display.display();
+}
+
 // Task to display sensor data
 void displayTask(void *parameter) {
     SensorData sensorData;
+    unsigned long lastPageChange = 0;
+    const unsigned long PAGE_DURATION = 3000;  // 3 seconds per page
+    uint8_t currentPage = 0;
     
     while (1) {
         if (xQueueReceive(sensorQueue, &sensorData, portMAX_DELAY) == pdTRUE) {
@@ -271,6 +310,50 @@ void displayTask(void *parameter) {
                 xSemaphoreGive(serialMutex);
             }
         }
+
+        // Update OLED display
+        if (millis() - lastPageChange >= PAGE_DURATION) {
+            lastPageChange = millis();
+            currentPage = (currentPage + 1) % 3;  // 3 pages total
+            
+            display.clearDisplay();
+            display.setCursor(0,0);
+            display.setTextSize(1);
+            
+            switch(currentPage) {
+                case 0:
+                    // Page 1: Temperature, Moisture, pH
+                    display.println("Soil Conditions:");
+                    display.printf("Temp: %.1fC\n", sensorData.temperature);
+                    display.printf("Moist: %.1f%%\n", sensorData.moisture);
+                    display.printf("pH: %.1f\n", sensorData.pH);
+                    display.printf("EC: %.1f us/cm\n", sensorData.conductivity);
+                    break;
+                    
+                case 1:
+                    // Page 2: NPK values
+                    display.println("NPK Values:");
+                    display.printf("N: %.1f mg/kg\n", sensorData.nitrogen);
+                    display.printf("P: %.1f mg/kg\n", sensorData.phosphorus);
+                    display.printf("K: %.1f mg/kg\n", sensorData.potassium);
+                    break;
+                    
+                case 2:
+                    // Page 3: Network Status
+                    display.println("Network Status:");
+                    display.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+                    display.printf("MQTT: %s\n", mqttClient.connected() ? "Connected" : "Disconnected");
+                    display.printf("RSSI: %d dBm\n", WiFi.RSSI());
+                    break;
+            }
+            
+            // Show update time
+            display.setCursor(0, 56);
+            display.printf("Last: %d sec ago", (millis() - lastPageChange) / 1000);
+            
+            display.display();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -278,6 +361,9 @@ void displayTask(void *parameter) {
 void setup() {
     // Initialize debug serial
     Serial.begin(115200);
+
+    // Initialize OLED
+    setupOLED();
     
     // Initialize RS485 serial
     RS485Serial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
@@ -330,7 +416,14 @@ void setup() {
         1                   // Core ID (1)
     );
     
-    Serial.println("ESP32 RS485 JXCT NPK Sensor Reader Started");
+    // Show ready message on OLED
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println(F("System Ready"));
+    display.println(F("Reading sensors..."));
+    display.display();
+    
+    Serial.println("ESP32 NPK Sensor Reader Started");
 }
 
 void loop() {
