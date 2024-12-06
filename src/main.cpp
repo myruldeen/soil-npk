@@ -16,7 +16,7 @@ const char* ssid = "norazlin@unifi";
 const char* password = "bkh223811286";
 
 // MQTT Broker settings
-const char* mqtt_server = "test.mosquitto.org";
+const char* mqtt_server = "192.168.1.11";
 const int mqtt_port = 1883;
 const char* mqtt_user = "";
 const char* mqtt_password = "";
@@ -115,48 +115,60 @@ bool readParameter(const byte* command, float &value, const char* paramName) {
     byte responseBuffer[8];
     bool success = false;
     
-    if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {  // 1 second timeout for mutex
         digitalWrite(RTS_PIN, HIGH);
         vTaskDelay(pdMS_TO_TICKS(10));
+        
+        // Clear any existing data in the buffer
+        while(RS485Serial.available()) {
+            RS485Serial.read();
+        }
+        
         RS485Serial.write(command, commandLength);
         RS485Serial.flush();
         digitalWrite(RTS_PIN, LOW);
         
         unsigned long startTime = millis();
-        while (RS485Serial.available() < 7 && (millis() - startTime) < 1000) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+        bool timeout = false;
+        
+        // Wait for response with timeout
+        while (RS485Serial.available() < 7) {
+            if (millis() - startTime > 1000) {  // 1 second timeout
+                timeout = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));  // Give other tasks a chance to run
         }
         
-        if (RS485Serial.available() >= 7) {
+        if (!timeout && RS485Serial.available() >= 7) {
             int bytesRead = RS485Serial.readBytes(responseBuffer, 7);
             if (bytesRead == 7) {
-                uint16_t receivedCRC = (responseBuffer[bytesRead-1] << 8) | responseBuffer[bytesRead-2];
-                uint16_t calculatedCRC = calculateCRC16(responseBuffer, bytesRead-2);
+                uint16_t rawValue = (responseBuffer[3] << 8) | responseBuffer[4];
                 
-                if (receivedCRC == calculatedCRC) {
-                    uint16_t rawValue = (responseBuffer[3] << 8) | responseBuffer[4];
-                    
-                    // Special handling for pH values
-                    if (command == readPH) {
-                        value = rawValue / 100.0; // Divide by 100 instead of 10 for pH
-                        // Sanity check for pH values
-                        if (value < 0 || value > 14) {
-                            Serial.println("Warning: pH value out of range!");
-                            success = false;
-                        } else {
-                            success = true;
-                        }
+                // Special handling for pH values
+                if (command == readPH) {
+                    value = rawValue / 100.0; // Divide by 100 instead of 10 for pH
+                    // Sanity check for pH values
+                    if (value < 0 || value > 14) {
+                        Serial.println("Warning: pH value out of range!");
+                        success = false;
                     } else {
-                        value = rawValue / 10.0; // Normal scaling for other parameters
                         success = true;
                     }
-                    
-                    Serial.printf("%s: %.1f\n", paramName, value);
+                } else {
+                    value = rawValue / 10.0; // Normal scaling for other parameters
+                    success = true;
                 }
+                
+                Serial.printf("%s: %.1f\n", paramName, value);
             }
+        } else {
+            Serial.printf("Timeout or error reading %s\n", paramName);
         }
+        
         xSemaphoreGive(serialMutex);
     }
+    
     return success;
 }
 
@@ -209,38 +221,64 @@ void mqttTask(void *parameter) {
 
 // Task to read sensor data
 void sensorTask(void *parameter) {
+    const int MAX_RETRIES = 3;
+    const int RETRY_DELAY = 1000;  // 1 second between retries
+    
     while (1) {
         SensorData sensorData;
         sensorData.isValid = false;
-        sensorData.timestamp = millis();
+        int retryCount = 0;
+        bool readSuccess = false;
         
-        bool success = true;
-        success &= readParameter(readN, sensorData.nitrogen, "Nitrogen");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        success &= readParameter(readP, sensorData.phosphorus, "Phosphorus");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        success &= readParameter(readK, sensorData.potassium, "Potassium");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        success &= readParameter(readTemp, sensorData.temperature, "Temperature");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        success &= readParameter(readMoisture, sensorData.moisture, "Moisture");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        success &= readParameter(readEC, sensorData.conductivity, "Conductivity");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        success &= readParameter(readPH, sensorData.pH, "pH");
-        
-        sensorData.isValid = success;
-
-        if (success) {
-            // Send data to display queue
-            xQueueSend(sensorQueue, &sensorData, 0);
+        do {
+            bool success = true;
             
-            // Send data to MQTT queue
-            xQueueSend(mqttQueue, &sensorData, 0);
+            // Try to read each parameter
+            success &= readParameter(readTemp, sensorData.temperature, "Temperature");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            if (!success) {
+                retryCount++;
+                Serial.printf("Retry %d of %d for sensor readings\n", retryCount, MAX_RETRIES);
+                vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY));
+                continue;
+            }
+            
+            success &= readParameter(readMoisture, sensorData.moisture, "Moisture");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            success &= readParameter(readPH, sensorData.pH, "pH");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            success &= readParameter(readEC, sensorData.conductivity, "Conductivity");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            success &= readParameter(readN, sensorData.nitrogen, "Nitrogen");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            success &= readParameter(readP, sensorData.phosphorus, "Phosphorus");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            success &= readParameter(readK, sensorData.potassium, "Potassium");
+            
+            if (success) {
+                sensorData.isValid = true;
+                readSuccess = true;
+                retryCount = 0;
+                xQueueSend(sensorQueue, &sensorData, 0);
+                xQueueSend(mqttQueue, &sensorData, 0);
+                blinkLED(1, 50);
+            } else {
+                retryCount++;
+                Serial.printf("Retry %d of %d for sensor readings\n", retryCount, MAX_RETRIES);
+                vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY));
+            }
+            
+        } while (!readSuccess && retryCount < MAX_RETRIES);
+        
+        if (!readSuccess) {
+            Serial.println("Failed to read sensor after maximum retries");
+            SensorData errorData;
+            errorData.isValid = false;
+            xQueueSend(sensorQueue, &errorData, 0);
         }
         
-        // Wait before next reading
-        vTaskDelay(pdMS_TO_TICKS(5000));  // 5 second delay
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
@@ -300,72 +338,68 @@ void setupOLED() {
 void displayTask(void *parameter) {
     SensorData sensorData;
     unsigned long lastPageChange = 0;
-    const unsigned long PAGE_DURATION = 3000;  // 3 seconds per page
+    const unsigned long PAGE_DURATION = 3000;
     uint8_t currentPage = 0;
     
     while (1) {
-        if (xQueueReceive(sensorQueue, &sensorData, portMAX_DELAY) == pdTRUE) {
-            if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
-                if (sensorData.isValid) {
-                    Serial.println("\n=== Complete Sensor Reading ===");
-                    Serial.printf("Nitrogen: %.1f mg/kg\n", sensorData.nitrogen);
-                    Serial.printf("Phosphorus: %.1f mg/kg\n", sensorData.phosphorus);
-                    Serial.printf("Potassium: %.1f mg/kg\n", sensorData.potassium);
-                    Serial.printf("pH: %.1f\n", sensorData.pH);
-                    Serial.printf("Moisture: %.1f %%\n", sensorData.moisture);
-                    Serial.printf("Temperature: %.1f °C\n", sensorData.temperature);
-                    Serial.printf("Conductivity: %.1f us/cm\n", sensorData.conductivity);
-                    Serial.println("==============================\n");
-                } else {
-                    Serial.println("Failed to read complete sensor data!");
+        if (xQueueReceive(sensorQueue, &sensorData, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (!sensorData.isValid) {
+                // Show error message on OLED
+                display.clearDisplay();
+                display.setCursor(0,0);
+                display.setTextSize(1);
+                display.println("Sensor Error!");
+                display.println("Check connection");
+                display.println("Retrying...");
+                display.display();
+                
+                Serial.println("Sensor disconnected or not responding");
+                continue;
+            }
+            
+            // Update OLED display
+            if (millis() - lastPageChange >= PAGE_DURATION) {
+                lastPageChange = millis();
+                currentPage = (currentPage + 1) % 3;  // 3 pages total
+                
+                display.clearDisplay();
+                display.setCursor(0,0);
+                display.setTextSize(1);
+                
+                switch(currentPage) {
+                    case 0:
+                        // Page 1: Temperature, Moisture, pH
+                        display.println("Soil Conditions:");
+                        display.printf("Temp: %.1fC\n", sensorData.temperature);
+                        display.printf("Moist: %.1f%%\n", sensorData.moisture);
+                        display.printf("pH: %s\n", String(sensorData.pH, 1).c_str());  // Force 1 decimal
+                        display.printf("EC: %.1f us/cm\n", sensorData.conductivity);
+                        break;
+                        
+                    case 1:
+                        // Page 2: NPK values
+                        display.println("NPK Values:");
+                        display.printf("N: %.1f mg/kg\n", sensorData.nitrogen);
+                        display.printf("P: %.1f mg/kg\n", sensorData.phosphorus);
+                        display.printf("K: %.1f mg/kg\n", sensorData.potassium);
+                        break;
+                        
+                    case 2:
+                        // Page 3: Network Status
+                        display.println("Network Status:");
+                        display.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+                        display.printf("MQTT: %s\n", mqttClient.connected() ? "Connected" : "Disconnected");
+                        display.printf("RSSI: %d dBm\n", WiFi.RSSI());
+                        break;
                 }
-                xSemaphoreGive(serialMutex);
+                
+                // Show update time
+                display.setCursor(0, 56);
+                display.printf("Last: %d sec ago", (millis() - lastPageChange) / 1000);
+                
+                display.display();
             }
         }
-
-        // Update OLED display
-        if (millis() - lastPageChange >= PAGE_DURATION) {
-            lastPageChange = millis();
-            currentPage = (currentPage + 1) % 3;  // 3 pages total
-            
-            display.clearDisplay();
-            display.setCursor(0,0);
-            display.setTextSize(1);
-            
-            switch(currentPage) {
-                case 0:
-                    // Page 1: Temperature, Moisture, pH
-                    display.println("Soil Conditions:");
-                    display.printf("Temp: %.1fC\n", sensorData.temperature);
-                    display.printf("Moist: %.1f%%\n", sensorData.moisture);
-                    display.printf("pH: %.1f\n", sensorData.pH);
-                    display.printf("EC: %.1f us/cm\n", sensorData.conductivity);
-                    break;
-                    
-                case 1:
-                    // Page 2: NPK values
-                    display.println("NPK Values:");
-                    display.printf("N: %.1f mg/kg\n", sensorData.nitrogen);
-                    display.printf("P: %.1f mg/kg\n", sensorData.phosphorus);
-                    display.printf("K: %.1f mg/kg\n", sensorData.potassium);
-                    break;
-                    
-                case 2:
-                    // Page 3: Network Status
-                    display.println("Network Status:");
-                    display.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-                    display.printf("MQTT: %s\n", mqttClient.connected() ? "Connected" : "Disconnected");
-                    display.printf("RSSI: %d dBm\n", WiFi.RSSI());
-                    break;
-            }
-            
-            // Show update time
-            display.setCursor(0, 56);
-            display.printf("Last: %d sec ago", (millis() - lastPageChange) / 1000);
-            
-            display.display();
-        }
-
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
