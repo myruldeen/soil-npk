@@ -395,7 +395,7 @@ void displayTask(void *parameter) {
                 
                 // Show update time
                 display.setCursor(0, 56);
-                display.printf("Last: %d sec ago", (millis() - lastPageChange) / 1000);
+                display.printf("Device: %s", device_id);
                 
                 display.display();
             }
