@@ -12,11 +12,11 @@
 #include "freertos/semphr.h"
 
 // WiFi credentials
-const char* ssid = "norazlin@unifi";
-const char* password = "bkh223811286";
+const char* ssid = "";
+const char* password = "";
 
 // MQTT Broker settings
-const char* mqtt_server = "192.168.1.11";
+const char* mqtt_server = "denodev.duckdns.org";
 const int mqtt_port = 1883;
 const char* mqtt_user = "";
 const char* mqtt_password = "";
